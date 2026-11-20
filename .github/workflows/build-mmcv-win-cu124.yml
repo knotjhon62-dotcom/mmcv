@@ -134,10 +134,90 @@ jobs:
           python -c "import os, zipfile; z = zipfile.ZipFile(os.environ['MMCV_WHEEL']); ops = [n for n in z.namelist() if n.startswith('mmcv/_ext') and n.endswith('.pyd')]; print('Compiled MMCV extension:', ops); assert ops, 'The wheel is missing the compiled MMCV ops extension'"
           Write-Host "Built: $($wheel.Name)"
 
+      # A Python wheel cannot embed other wheels as installable dependencies.
+      # Create a separate, self-contained wheelhouse for offline Windows/Python 3.10 installs.
+      - name: Download complete offline dependency wheelhouse
+        run: |
+          New-Item -ItemType Directory -Path wheelhouse -Force | Out-Null
+          $mmcv = Get-ChildItem -Path dist -Filter 'mmcv-2.2.0-cp310-cp310-win_amd64.whl' | Select-Object -First 1
+          if (-not $mmcv) { throw 'MMCV cp310 win_amd64 wheel is missing' }
+
+          # Download using this Windows/Python 3.10 environment, not the host OS
+          # of the user's future installation. --only-binary prevents sdists.
+          # Explicit torch/torchvision pins stop the resolver upgrading to a
+          # different CUDA build when it resolves transitive dependencies.
+          python -m pip download `
+            --dest wheelhouse `
+            --only-binary=:all: `
+            --timeout 120 `
+            --retries 10 `
+            --extra-index-url https://download.pytorch.org/whl/cu124 `
+            $mmcv.FullName `
+            'numpy==1.26.4' `
+            'torch==2.5.0+cu124' `
+            'torchvision==0.20.0+cu124'
+          if ($LASTEXITCODE -ne 0) { throw 'Could not download the full dependency wheelhouse' }
+
+          # Require all the essential wheels in the actual upload directory.
+          foreach ($pkg in @('mmcv-', 'mmengine-', 'torch-', 'torchvision-', 'numpy-')) {
+            if (-not (Get-ChildItem wheelhouse -Filter "$pkg*.whl" | Select-Object -First 1)) {
+              throw "No $pkg wheel in offline bundle"
+            }
+          }
+          Write-Host 'Offline wheelhouse packages:'
+          Get-ChildItem wheelhouse -Filter '*.whl' | Sort-Object Name | Select-Object Name, Length | Format-Table -AutoSize
+
+      - name: Check offline wheelhouse resolution
+        run: |
+          # Ignore already-installed runner packages: verify that the bundle
+          # really contains all dependencies needed on another Windows PC.
+          $mmcv = Get-ChildItem wheelhouse -Filter 'mmcv-2.2.0-cp310-cp310-win_amd64.whl' | Select-Object -First 1
+          if (-not $mmcv) { throw 'MMCV wheel not found in wheelhouse' }
+          python -m pip install --dry-run --ignore-installed `
+            --no-index --find-links wheelhouse `
+            $mmcv.FullName `
+            'numpy==1.26.4' `
+            'torch==2.5.0+cu124' `
+            'torchvision==0.20.0+cu124'
+          if ($LASTEXITCODE -ne 0) { throw 'Offline bundle is incomplete' }
+
+      - name: Write offline installation script
+        run: |
+          $installer = @'
+          param([string]$Python = 'python')
+          $ErrorActionPreference = 'Stop'
+          $wheelhouse = Join-Path $PSScriptRoot 'wheelhouse'
+          if (-not (Test-Path -LiteralPath $wheelhouse)) {
+              throw "Missing wheelhouse directory: $wheelhouse"
+          }
+          $mmcv = Get-ChildItem -LiteralPath $wheelhouse -Filter 'mmcv-2.2.0-cp310-cp310-win_amd64.whl' | Select-Object -First 1
+          if (-not $mmcv) { throw 'MMCV wheel not found in wheelhouse' }
+          Write-Host 'Installing MMCV and all dependencies without contacting PyPI...'
+          & $Python -m pip install --no-index --find-links "$wheelhouse" `
+              'numpy==1.26.4' 'torch==2.5.0+cu124' 'torchvision==0.20.0+cu124' $mmcv.FullName
+          if ($LASTEXITCODE -ne 0) { throw 'Offline installation failed' }
+          & $Python -m pip check
+          if ($LASTEXITCODE -ne 0) { Write-Warning 'pip check found environment conflicts; review the output above' }
+          & $Python -c "import torch, torchvision, mmcv, mmcv._ext; print('torch:', torch.__version__, 'CUDA:', torch.version.cuda); print('torchvision:', torchvision.__version__); print('mmcv:', mmcv.__version__); print('MMCV extension import: OK')"
+          if ($LASTEXITCODE -ne 0) { throw 'MMCV import verification failed' }
+          '@
+          Set-Content -Path install-offline.ps1 -Value $installer -Encoding UTF8
+
       - name: Upload wheel
         uses: actions/upload-artifact@v4
         with:
           name: mmcv-2.2.0-win_amd64-py310-torch250-cu124-sm86
           path: dist/*.whl
           if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload offline bundle (MMCV + all required wheels + installer)
+        uses: actions/upload-artifact@v4
+        with:
+          name: mmcv-2.2.0-win_amd64-py310-torch250-cu124-sm86-OFFLINE
+          path: |
+            wheelhouse/
+            install-offline.ps1
+          if-no-files-found: error
+          compression-level: 0
           retention-days: 30
