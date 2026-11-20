@@ -17,6 +17,7 @@ jobs:
       MMCV_WITH_OPS: "1"
       FORCE_CUDA: "1"
       TORCH_CUDA_ARCH_LIST: "8.6"
+      DISTUTILS_USE_SDK: "1"
       MAX_JOBS: "2"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
