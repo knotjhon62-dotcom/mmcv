@@ -45,13 +45,26 @@ jobs:
           if (-not $vs) { throw 'Visual Studio 2022 installation not found' }
           $toolset = Join-Path $vs 'VC\Tools\MSVC'
           if (-not (Get-ChildItem $toolset -Directory -Filter '14.39.*' -ErrorAction SilentlyContinue)) {
-            $installer = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vs_installer.exe'
+            # setup.exe is the supported CLI for modifying an existing VS installation.
+            # Do NOT pass --wait here: it is supported by bootstrapper EXEs only.
+            $installer = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\setup.exe'
+            if (-not (Test-Path $installer)) { throw "VS setup.exe not found: $installer" }
             $proc = Start-Process -FilePath $installer -ArgumentList @(
               'modify', '--installPath', "`"$vs`"",
               '--add', 'Microsoft.VisualStudio.Component.VC.14.39.17.9.x86.x64',
-              '--quiet', '--wait', '--norestart'
+              '--quiet', '--norestart'
             ) -Wait -PassThru
-            if ($proc.ExitCode -ne 0) { throw "MSVC 14.39 installation failed: $($proc.ExitCode)" }
+            if ($proc.ExitCode -ne 0) {
+              Write-Host "Visual Studio installer exit code: $($proc.ExitCode)"
+              # Surface useful installer diagnostics in the GitHub Actions logs.
+              Get-ChildItem $env:TEMP -Filter 'dd_*.log' -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 3 |
+                ForEach-Object {
+                  Write-Host "--- $($_.FullName) (last 40 lines) ---"
+                  Get-Content $_.FullName -Tail 40 -ErrorAction SilentlyContinue
+                }
+              throw "MSVC 14.39 installation failed: $($proc.ExitCode)"
+            }
           }
           if (-not (Get-ChildItem $toolset -Directory -Filter '14.39.*' -ErrorAction SilentlyContinue)) {
             throw 'MSVC 14.39 toolset not found after installation'
