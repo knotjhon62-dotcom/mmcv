@@ -71,20 +71,39 @@ jobs:
             throw 'MSVC 14.39 toolset not found after installation'
           }
 
-      - name: Install CUDA Toolkit 12.4.1 (compiler, no GPU driver)
+      - name: Install CUDA Toolkit 12.4.1 (compiler and development libraries, no GPU driver)
         uses: Jimver/cuda-toolkit@v0.2.36
         with:
           cuda: "12.4.1"
           method: network
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust", "nvrtc", "nvrtc_dev", "visual_studio_integration"]'
+          # PyTorch CUDA headers include cusparse.h and may use other CUDA library headers.
+          # These *_dev packages are required for compilation, even on GPU-less runners.
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "cusparse", "cusparse_dev", "cusolver", "cusolver_dev", "curand", "curand_dev", "cufft", "cufft_dev", "nvjitlink", "thrust", "nvrtc", "nvrtc_dev", "visual_studio_integration"]'
 
-      - name: Configure CUDA and check toolkit
+      - name: Configure CUDA and verify development headers and libraries
         run: |
           if (-not $env:CUDA_PATH) { throw "CUDA_PATH was not set" }
           "CUDA_HOME=$env:CUDA_PATH" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           & "$env:CUDA_PATH\bin\nvcc.exe" --version
-          if (-not (Test-Path "$env:CUDA_PATH\include\cuda_runtime.h")) {
-            throw "CUDA development headers missing"
+          if ($LASTEXITCODE -ne 0) { throw "nvcc --version failed" }
+          $required = @(
+            'include\cuda_runtime.h',
+            'include\cublas_v2.h',
+            'include\cusparse.h',
+            'include\cusolverDn.h',
+            'include\curand.h',
+            'include\cufft.h',
+            'lib\x64\cudart.lib',
+            'lib\x64\cublas.lib',
+            'lib\x64\cusparse.lib',
+            'lib\x64\cusolver.lib'
+          )
+          foreach ($relPath in $required) {
+            $fullPath = Join-Path $env:CUDA_PATH $relPath
+            if (-not (Test-Path -LiteralPath $fullPath)) {
+              throw "CUDA 12.4 development component missing: $fullPath"
+            }
+            Write-Host "Found $relPath"
           }
 
       - name: Install exact PyTorch / torchvision CUDA wheels and build tools
