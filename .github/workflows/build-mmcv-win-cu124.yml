@@ -1,0 +1,110 @@
+name: Build MMCV wheel - Win64 Py310 Torch250 CUDA124 sm86
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-wheel:
+    runs-on: windows-2022
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      MMCV_WITH_OPS: "1"
+      FORCE_CUDA: "1"
+      TORCH_CUDA_ARCH_LIST: "8.6"
+      MAX_JOBS: "2"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+    steps:
+      - name: Checkout MMCV 2.2.0
+        uses: actions/checkout@v4
+        with:
+          repository: open-mmlab/mmcv
+          ref: v2.2.0
+          path: mmcv-src
+          persist-credentials: false
+
+      - name: Create Python 3.10 Conda environment
+        uses: conda-incubator/setup-miniconda@v4
+        with:
+          activate-environment: mmcv-build
+          python-version: "3.10"
+          auto-update-conda: true
+
+      # CUDA 12.4 requires an older MSVC host compiler than the
+      # latest default on windows-2022. Install VS2022 v143 toolset 14.39.
+      - name: Install CUDA 12.4-compatible MSVC 14.39 toolset
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'Visual Studio 2022 installation not found' }
+          $toolset = Join-Path $vs 'VC\Tools\MSVC'
+          if (-not (Get-ChildItem $toolset -Directory -Filter '14.39.*' -ErrorAction SilentlyContinue)) {
+            $installer = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vs_installer.exe'
+            $proc = Start-Process -FilePath $installer -ArgumentList @(
+              'modify', '--installPath', "`"$vs`"",
+              '--add', 'Microsoft.VisualStudio.Component.VC.14.39.17.9.x86.x64',
+              '--quiet', '--wait', '--norestart'
+            ) -Wait -PassThru
+            if ($proc.ExitCode -ne 0) { throw "MSVC 14.39 installation failed: $($proc.ExitCode)" }
+          }
+          if (-not (Get-ChildItem $toolset -Directory -Filter '14.39.*' -ErrorAction SilentlyContinue)) {
+            throw 'MSVC 14.39 toolset not found after installation'
+          }
+
+      - name: Install CUDA Toolkit 12.4.1 (compiler, no GPU driver)
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: "12.4.1"
+          method: network
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust", "nvrtc", "nvrtc_dev", "visual_studio_integration"]'
+
+      - name: Configure CUDA and check toolkit
+        run: |
+          if (-not $env:CUDA_PATH) { throw "CUDA_PATH was not set" }
+          "CUDA_HOME=$env:CUDA_PATH" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          & "$env:CUDA_PATH\bin\nvcc.exe" --version
+          if (-not (Test-Path "$env:CUDA_PATH\include\cuda_runtime.h")) {
+            throw "CUDA development headers missing"
+          }
+
+      - name: Install exact PyTorch / torchvision CUDA wheels and build tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "setuptools==69.5.1" wheel ninja psutil packaging "numpy==1.26.4"
+          python -m pip install "torch==2.5.0+cu124" "torchvision==0.20.0+cu124" --index-url https://download.pytorch.org/whl/cu124
+          python -c "import torch, torchvision; print('torch:', torch.__version__, 'CUDA:', torch.version.cuda); print('torchvision:', torchvision.__version__); assert torch.__version__ == '2.5.0+cu124'; assert torchvision.__version__ == '0.20.0+cu124'; assert torch.version.cuda == '12.4'"
+
+      - name: Build Windows CUDA wheel using Visual Studio 2022
+        working-directory: mmcv-src
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'VS2022 C++ toolchain not found' }
+          Import-Module (Join-Path $vs 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
+          Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-arch=amd64 -host_arch=amd64 -vcvars_ver=14.39'
+          where.exe cl
+          nvcc --version
+          python -m pip wheel . --no-deps --no-build-isolation --wheel-dir ..\dist -v
+          if ($LASTEXITCODE -ne 0) { throw 'MMCV wheel build failed' }
+
+      - name: Verify compiled extension is inside the wheel
+        run: |
+          $wheel = Get-ChildItem -Path dist -Filter 'mmcv-*.whl' | Select-Object -First 1
+          if (-not $wheel) { throw 'No MMCV wheel produced' }
+          $env:MMCV_WHEEL = $wheel.FullName
+          python -c "import os, zipfile; z = zipfile.ZipFile(os.environ['MMCV_WHEEL']); ops = [n for n in z.namelist() if n.startswith('mmcv/_ext') and n.endswith('.pyd')]; print('Compiled MMCV extension:', ops); assert ops, 'The wheel is missing the compiled MMCV ops extension'"
+          Write-Host "Built: $($wheel.Name)"
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: mmcv-2.2.0-win_amd64-py310-torch250-cu124-sm86
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 30
